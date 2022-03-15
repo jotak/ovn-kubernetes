@@ -20,7 +20,7 @@ else
 CONTAINER_RUNTIME=docker
 endif
 CONTAINER_RUNNABLE ?= $(shell $(CONTAINER_RUNTIME) -v > /dev/null 2>&1; echo $$?)
-OVN_VERSION ?= v21.09.1
+OVN_VERSION ?= ovn-ipfix
 
 .PHONY: all build check test
 
@@ -78,7 +78,7 @@ else
 endif
 
 pkg/nbdb/ovn-nb.ovsschema:
-	curl -sSL https://raw.githubusercontent.com/ovn-org/ovn/$(OVN_VERSION)/ovn-nb.ovsschema -o $@
+	curl -sSL https://raw.githubusercontent.com/amorenoz/ovn/$(OVN_VERSION)/ovn-nb.ovsschema -o $@
 
 pkg/sbdb/ovn-sb.ovsschema:
-	curl -sSL https://raw.githubusercontent.com/ovn-org/ovn/$(OVN_VERSION)/ovn-sb.ovsschema -o $@
+	curl -sSL https://raw.githubusercontent.com/amorenoz/ovn/$(OVN_VERSION)/ovn-sb.ovsschema -o $@

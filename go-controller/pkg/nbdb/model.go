@@ -40,12 +40,13 @@ func FullDatabaseModel() (model.ClientDBModel, error) {
 		"Port_Group":                  &PortGroup{},
 		"QoS":                         &QoS{},
 		"SSL":                         &SSL{},
+		"Sample":                      &Sample{},
 	})
 }
 
 var schema = `{
   "name": "OVN_Northbound",
-  "version": "5.33.1",
+  "version": "6.0.0",
   "tables": {
     "ACL": {
       "columns": {
@@ -134,6 +135,17 @@ var schema = `{
               "minInteger": 0,
               "maxInteger": 32767
             }
+          }
+        },
+        "sample": {
+          "type": {
+            "key": {
+              "type": "uuid",
+              "refTable": "Sample",
+              "refType": "strong"
+            },
+            "min": 0,
+            "max": 1
           }
         },
         "severity": {
@@ -351,6 +363,18 @@ var schema = `{
     },
     "Copp": {
       "columns": {
+        "external_ids": {
+          "type": {
+            "key": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            },
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
         "meters": {
           "type": {
             "key": {
@@ -362,8 +386,16 @@ var schema = `{
             "min": 0,
             "max": "unlimited"
           }
+        },
+        "name": {
+          "type": "string"
         }
-      }
+      },
+      "indexes": [
+        [
+          "name"
+        ]
+      ]
     },
     "DHCP_Options": {
       "columns": {
@@ -1094,6 +1126,9 @@ var schema = `{
             "min": 0,
             "max": 1
           }
+        },
+        "route_table": {
+          "type": "string"
         }
       }
     },
@@ -1782,6 +1817,37 @@ var schema = `{
         },
         "ssl_protocols": {
           "type": "string"
+        }
+      }
+    },
+    "Sample": {
+      "columns": {
+        "collector_set_id": {
+          "type": {
+            "key": {
+              "type": "integer",
+              "minInteger": 0,
+              "maxInteger": 4294967295
+            }
+          }
+        },
+        "obs_point_id": {
+          "type": {
+            "key": {
+              "type": "integer",
+              "minInteger": 0,
+              "maxInteger": 4294967295
+            }
+          }
+        },
+        "probability": {
+          "type": {
+            "key": {
+              "type": "integer",
+              "minInteger": 0,
+              "maxInteger": 65535
+            }
+          }
         }
       }
     }

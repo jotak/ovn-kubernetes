@@ -36,5 +36,6 @@ type ACL struct {
 	Meter       *string           `ovsdb:"meter"`
 	Name        *string           `ovsdb:"name"`
 	Priority    int               `ovsdb:"priority"`
+	Sample      *string           `ovsdb:"sample"`
 	Severity    *ACLSeverity      `ovsdb:"severity"`
 }
