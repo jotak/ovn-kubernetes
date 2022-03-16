@@ -1,6 +1,7 @@
 package ovn
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -41,9 +42,21 @@ const (
 	policyTypeACLExtIdKey = "policy_type"
 	// policyTypeNumACLExtIdKey external ID key for policy index by type on 'gress policy ACLs
 	policyTypeNumACLExtIdKey = "%s_num"
+	// Annotation for enabling ACL sampling
+	aclSamplingAnnotation = "k8s.ovn.org/acl-sampling"
 )
 
 var NetworkPolicyNotCreated error
+
+type GressACLSampling struct {
+	ObservationPointID int `json:"observation_point_id,omitempty"`
+	Probability        int `json:"probability,omitempty"`
+}
+
+type ACLSampling struct {
+	Ingress *GressACLSampling `json:"ingress,omitempty"`
+	Egress  *GressACLSampling `json:"egress,omitempty"`
+}
 
 type networkPolicy struct {
 	// RWMutex synchronizes operations on the policy.
@@ -67,9 +80,18 @@ type networkPolicy struct {
 	portGroupName string
 	deleted       bool //deleted policy
 	created       bool
+
+	// ACL Sampling configuration
+	sample *ACLSampling
 }
 
 func NewNetworkPolicy(policy *knet.NetworkPolicy) *networkPolicy {
+	var sample ACLSampling
+	if sConfig, ok := policy.Annotations[aclSamplingAnnotation]; ok {
+		if err := json.Unmarshal([]byte(sConfig), &sample); err != nil {
+			klog.Warningf("Failed to get unmarshall acl-sampling annotation: %v", err)
+		}
+	}
 	np := &networkPolicy{
 		name:            policy.Name,
 		namespace:       policy.Namespace,
@@ -80,6 +102,7 @@ func NewNetworkPolicy(policy *knet.NetworkPolicy) *networkPolicy {
 		svcHandlerList:  make([]*factory.Handler, 0),
 		nsHandlerList:   make([]*factory.Handler, 0),
 		localPods:       sync.Map{},
+		sample:          &sample,
 	}
 	return np
 }
@@ -253,6 +276,8 @@ func (oc *Controller) createDefaultDenyPGAndACLs(namespace, policy string, nsInf
 }
 
 func (oc *Controller) updateACLLoggingForPolicy(np *networkPolicy, logLevel string) error {
+	var ops []ovsdb.Operation
+	var err error
 	np.Lock()
 	defer np.Unlock()
 
@@ -264,8 +289,12 @@ func (oc *Controller) updateACLLoggingForPolicy(np *networkPolicy, logLevel stri
 		return NetworkPolicyNotCreated
 	}
 
-	acls := oc.buildNetworkPolicyACLs(np, logLevel)
-	ops, err := libovsdbops.UpdateACLsLoggingOps(oc.nbClient, nil, acls...)
+	acls, sample := oc.buildNetworkPolicyACLs(np, logLevel)
+	ops, err = libovsdbops.CreateSamplesOps(oc.nbClient, ops, acls, sample)
+	if err != nil {
+		return err
+	}
+	ops, err = libovsdbops.UpdateACLsLoggingOps(oc.nbClient, ops, acls...)
 	if err != nil {
 		return err
 	}
@@ -893,7 +922,7 @@ func (oc *Controller) createNetworkPolicy(np *networkPolicy, policy *knet.Networ
 	for i, ingressJSON := range policy.Spec.Ingress {
 		klog.V(5).Infof("Network policy ingress is %+v", ingressJSON)
 
-		ingress := newGressPolicy(knet.PolicyTypeIngress, i, policy.Namespace, policy.Name)
+		ingress := newGressPolicy(knet.PolicyTypeIngress, i, policy.Namespace, policy.Name, np.sample.Ingress)
 
 		// Each ingress rule can have multiple ports to which we allow traffic.
 		for _, portJSON := range ingressJSON.Ports {
@@ -930,7 +959,7 @@ func (oc *Controller) createNetworkPolicy(np *networkPolicy, policy *knet.Networ
 	for i, egressJSON := range policy.Spec.Egress {
 		klog.V(5).Infof("Network policy egress is %+v", egressJSON)
 
-		egress := newGressPolicy(knet.PolicyTypeEgress, i, policy.Namespace, policy.Name)
+		egress := newGressPolicy(knet.PolicyTypeEgress, i, policy.Namespace, policy.Name, np.sample.Egress)
 
 		// Each egress rule can have multiple ports to which we allow traffic.
 		for _, portJSON := range egressJSON.Ports {
@@ -982,10 +1011,16 @@ func (oc *Controller) createNetworkPolicy(np *networkPolicy, policy *knet.Networ
 	readableGroupName := fmt.Sprintf("%s_%s", policy.Namespace, policy.Name)
 	np.portGroupName = hashedPortGroup(readableGroupName)
 	ops := []ovsdb.Operation{}
+	var err error
 
 	// Build policy ACLs
-	acls := oc.buildNetworkPolicyACLs(np, aclLogAllow)
-	ops, err := libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, ops, acls...)
+	acls, samples := oc.buildNetworkPolicyACLs(np, aclLogAllow)
+	ops, err = libovsdbops.CreateSamplesOps(oc.nbClient, ops, acls, samples)
+	if err != nil {
+		klog.Errorf(err.Error())
+		return
+	}
+	ops, err = libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, ops, acls...)
 	if err != nil {
 		klog.Errorf(err.Error())
 		return
@@ -1077,18 +1112,25 @@ func (oc *Controller) addNetworkPolicy(policy *knet.NetworkPolicy) {
 
 // buildNetworkPolicyACLs builds the ACLS associated with the 'gress policies
 // of the provided network policy.
-func (oc *Controller) buildNetworkPolicyACLs(np *networkPolicy, aclLogging string) []*nbdb.ACL {
+func (oc *Controller) buildNetworkPolicyACLs(np *networkPolicy, aclLogging string) ([]*nbdb.ACL, []*nbdb.Sample) {
 	acls := []*nbdb.ACL{}
+	samples := []*nbdb.Sample{}
 	for _, gp := range np.ingressPolicies {
-		acl := gp.buildLocalPodACLs(np.portGroupName, aclLogging)
+		acl, sample := gp.buildLocalPodACLs(np.portGroupName, aclLogging)
 		acls = append(acls, acl...)
+		if sample != nil {
+			samples = append(samples, sample)
+		}
 	}
 	for _, gp := range np.egressPolicies {
-		acl := gp.buildLocalPodACLs(np.portGroupName, aclLogging)
+		acl, sample := gp.buildLocalPodACLs(np.portGroupName, aclLogging)
 		acls = append(acls, acl...)
+		if sample != nil {
+			samples = append(samples, sample)
+		}
 	}
 
-	return acls
+	return acls, samples
 }
 
 func (oc *Controller) deleteNetworkPolicy(policy *knet.NetworkPolicy) {
@@ -1347,13 +1389,21 @@ func (oc *Controller) handlePeerNamespaceAndPodSelector(
 }
 
 func (oc *Controller) handlePeerNamespaceSelectorOnUpdate(np *networkPolicy, gp *gressPolicy, doUpdate func() bool) {
+	var ops []ovsdb.Operation
+	var err error
 	aclLoggingLevels := oc.GetNetworkPolicyACLLogging(np.namespace)
 	np.Lock()
 	defer np.Unlock()
 	// This needs to be a write lock because there's no locking around 'gress policies
 	if !np.deleted && doUpdate() {
-		acls := gp.buildLocalPodACLs(np.portGroupName, aclLoggingLevels.Allow)
-		ops, err := libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, nil, acls...)
+		acls, sample := gp.buildLocalPodACLs(np.portGroupName, aclLoggingLevels.Allow)
+		if sample != nil {
+			ops, err = libovsdbops.CreateSamplesOps(oc.nbClient, ops, acls, []*nbdb.Sample{sample})
+			if err != nil {
+				klog.Errorf(err.Error())
+			}
+		}
+		ops, err = libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, ops, acls...)
 		if err != nil {
 			klog.Errorf(err.Error())
 		}

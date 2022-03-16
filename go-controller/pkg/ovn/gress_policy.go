@@ -43,6 +43,8 @@ type gressPolicy struct {
 	portPolicies []*portPolicy
 
 	ipBlock []*knet.IPBlock
+
+	sample *GressACLSampling
 }
 
 type portPolicy struct {
@@ -72,7 +74,7 @@ func (pp *portPolicy) getL4Match() (string, error) {
 	return foundProtocol, nil
 }
 
-func newGressPolicy(policyType knet.PolicyType, idx int, namespace, name string) *gressPolicy {
+func newGressPolicy(policyType knet.PolicyType, idx int, namespace, name string, sample *GressACLSampling) *gressPolicy {
 	return &gressPolicy{
 		policyNamespace:   namespace,
 		policyName:        name,
@@ -81,6 +83,7 @@ func newGressPolicy(policyType knet.PolicyType, idx int, namespace, name string)
 		peerV4AddressSets: sets.String{},
 		peerV6AddressSets: sets.String{},
 		portPolicies:      make([]*portPolicy, 0),
+		sample:            sample,
 	}
 }
 
@@ -304,7 +307,7 @@ func (gp *gressPolicy) delNamespaceAddressSet(name string) bool {
 // buildLocalPodACLs builds the ACLs that implement the gress policy's rules to the
 // given Port Group (which should contain all pod logical switch ports selected
 // by the parent NetworkPolicy)
-func (gp *gressPolicy) buildLocalPodACLs(portGroupName, aclLogging string) []*nbdb.ACL {
+func (gp *gressPolicy) buildLocalPodACLs(portGroupName, aclLogging string) ([]*nbdb.ACL, *nbdb.Sample) {
 	l3Match := gp.getL3MatchFromAddressSet()
 	var lportMatch string
 	var cidrMatches []string
@@ -315,6 +318,8 @@ func (gp *gressPolicy) buildLocalPodACLs(portGroupName, aclLogging string) []*nb
 	}
 
 	acls := []*nbdb.ACL{}
+	var sample *nbdb.Sample
+
 	if len(gp.portPolicies) == 0 {
 		match := fmt.Sprintf("%s && %s", l3Match, lportMatch)
 		l4Match := noneMatch
@@ -354,7 +359,24 @@ func (gp *gressPolicy) buildLocalPodACLs(portGroupName, aclLogging string) []*nb
 		}
 	}
 
-	return acls
+	if gp.sample != nil {
+		namedUUID := fmt.Sprintf("u_BuildLocalPodACLs_%s", knet.PolicyTypeIngress) // Has to start with 'u'
+		sample = gp.buildACLSample(namedUUID)
+		for _, acl := range acls {
+			acl.Sample = &namedUUID
+		}
+	}
+
+	return acls, sample
+}
+
+func (gp *gressPolicy) buildACLSample(namedUUID string) *nbdb.Sample {
+	if gp.sample == nil || gp.sample.Probability == 0 {
+		return nil
+	}
+	obsPointID := gp.sample.ObservationPointID
+	collectorSetID := 1 // TODO: Un-hardcode
+	return libovsdbops.BuildSample(namedUUID, collectorSetID, obsPointID, gp.sample.Probability)
 }
 
 // buildACLAllow builds an allow-related ACL for a given given match
