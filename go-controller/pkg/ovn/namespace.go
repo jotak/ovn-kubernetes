@@ -223,6 +223,16 @@ func (oc *Controller) configureNamespace(nsInfo *namespaceInfo, ns *kapi.Namespa
 		}
 	}
 
+	aclSampling := ns.Annotations[aclSamplingAnnotation]
+	if aclSampling != "" {
+		if oc.aclSamplingCanEnable(aclSampling, nsInfo) {
+			klog.Infof("Namespace %s: ACL sampling setting updated to ingress=%v, egress=%d",
+				ns, nsInfo.aclSampling.Ingress, nsInfo.aclSampling.Egress)
+		} else {
+			klog.Warningf("Namespace %s: ACL sampling is not enabled due to malformed annotation", ns.Name)
+		}
+	}
+
 	// TODO(trozet) figure out if there is any possibility of detecting if a pod GW already exists, which
 	// is servicing this namespace. Right now that would mean searching through all pods, which is very inefficient.
 	// For now it is required that a pod serving as a gateway for a namespace is added AFTER the serving namespace is
@@ -312,6 +322,23 @@ func (oc *Controller) updateNamespace(old, newer *kapi.Namespace) {
 				old.Name, nsInfo.aclLogging.Deny, nsInfo.aclLogging.Allow)
 		}
 	}
+
+	newACLSampling := newer.Annotations[aclSamplingAnnotation]
+	oldACLSampling := newer.Annotations[aclSamplingAnnotation]
+	if newACLSampling != oldACLSampling && (oc.aclSamplingCanEnable(newACLSampling, nsInfo) || newACLSampling == "") && len(nsInfo.networkPolicies) > 0 {
+		if err := oc.setACLSamplingForNamespace(old.Name, nsInfo); err != nil {
+			klog.Warningf(err.Error())
+		} else {
+			if nsInfo.aclSampling != nil {
+				klog.Infof("Namespace %s: ACL sampling setting updated to ingress=%v, egress=%d",
+					old.Name, nsInfo.aclSampling.Ingress, nsInfo.aclSampling.Egress)
+			} else {
+				klog.Infof("Namespace %s: ACL sampling setting disabled")
+			}
+		}
+
+	}
+
 	oc.multicastUpdateNamespace(newer, nsInfo)
 }
 

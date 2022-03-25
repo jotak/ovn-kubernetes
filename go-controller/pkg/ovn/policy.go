@@ -236,9 +236,15 @@ func defaultDenyPortGroup(namespace, gressSuffix string) string {
 	return hashedPortGroup(namespace) + "_" + gressSuffix
 }
 
-func buildDenyACLs(namespace, policy, pg, aclLogging string, policyType knet.PolicyType) (denyACL, allowACL *nbdb.ACL) {
+func buildDenyACLs(namespace, policy, pg, aclLogging string, policyType knet.PolicyType, sampling *GressACLSampling) (denyACL, allowACL *nbdb.ACL, sample *nbdb.Sample) {
 	denyMatch := getACLMatch(pg, "", policyType)
 	denyACL = buildACL(namespace, pg, policy, nbdb.ACLDirectionToLport, types.DefaultDenyPriority, denyMatch, nbdb.ACLActionDrop, aclLogging, policyType)
+	if sampling != nil && sampling.Probability != 0 {
+		namedUUID := fmt.Sprintf("u_DenyACLs_%s", policyType)
+		collectorSetID := 1 // TODO: Unhardcode
+		sample = libovsdbops.BuildSample(namedUUID, collectorSetID, sampling.ObservationPointID, sampling.Probability)
+		denyACL.Sample = &namedUUID
+	}
 	allowMatch := getACLMatch(pg, "arp", policyType)
 	allowACL = buildACL(namespace, pg, "ARPallowPolicy", nbdb.ACLDirectionToLport, types.DefaultAllowPriority, allowMatch, nbdb.ACLActionAllow, "", policyType)
 	return
@@ -247,12 +253,34 @@ func buildDenyACLs(namespace, policy, pg, aclLogging string, policyType knet.Pol
 // must be called with a write lock on nsInfo
 func (oc *Controller) createDefaultDenyPGAndACLs(namespace, policy string, nsInfo *namespaceInfo) error {
 	aclLogging := nsInfo.aclLogging.Deny
+	var sampling *GressACLSampling
+	samples := []*nbdb.Sample{}
+
+	if nsInfo.aclSampling != nil && nsInfo.aclSampling.Ingress != nil {
+		sampling = nsInfo.aclSampling.Ingress
+	}
 
 	ingressPGName := defaultDenyPortGroup(namespace, "ingressDefaultDeny")
-	ingressDenyACL, ingressAllowACL := buildDenyACLs(namespace, policy, ingressPGName, aclLogging, knet.PolicyTypeIngress)
+	ingressDenyACL, ingressAllowACL, sample := buildDenyACLs(namespace, policy, ingressPGName, aclLogging, knet.PolicyTypeIngress, sampling)
+	if sample != nil {
+		samples = append(samples, sample)
+	}
+
+	sampling = nil
+	if nsInfo.aclSampling != nil && nsInfo.aclSampling.Egress != nil {
+		sampling = nsInfo.aclSampling.Egress
+	}
 	egressPGName := defaultDenyPortGroup(namespace, "egressDefaultDeny")
-	egressDenyACL, egressAllowACL := buildDenyACLs(namespace, policy, egressPGName, aclLogging, knet.PolicyTypeEgress)
-	ops, err := libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, nil, ingressDenyACL, ingressAllowACL, egressDenyACL, egressAllowACL)
+	egressDenyACL, egressAllowACL, sample := buildDenyACLs(namespace, policy, egressPGName, aclLogging, knet.PolicyTypeEgress, sampling)
+	if sample != nil {
+		samples = append(samples, sample)
+	}
+
+	ops, err := libovsdbops.CreateSamplesOps(oc.nbClient, nil, append([]*nbdb.ACL{ingressDenyACL}, egressDenyACL), samples)
+	if err != nil {
+		klog.Errorf(err.Error())
+	}
+	ops, err = libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, ops, ingressDenyACL, ingressAllowACL, egressDenyACL, egressAllowACL)
 	if err != nil {
 		return err
 	}
@@ -302,10 +330,48 @@ func (oc *Controller) updateACLLoggingForPolicy(np *networkPolicy, logLevel stri
 	return err
 }
 
+func (oc *Controller) setACLSamplingForNamespace(ns string, nsInfo *namespaceInfo) error {
+	var ovsDBOps []ovsdb.Operation
+	acls := []*nbdb.ACL{}
+	samples := []*nbdb.Sample{}
+
+	for _, policyType := range []knet.PolicyType{knet.PolicyTypeIngress, knet.PolicyTypeEgress} {
+		var sampling *GressACLSampling
+		if policyType == knet.PolicyTypeIngress && nsInfo.aclSampling != nil && nsInfo.aclSampling.Ingress != nil {
+			sampling = nsInfo.aclSampling.Ingress
+		} else if policyType == knet.PolicyTypeEgress && nsInfo.aclSampling != nil && nsInfo.aclSampling.Egress != nil {
+			sampling = nsInfo.aclSampling.Egress
+		}
+		denyACL, _, sample := buildDenyACLs(ns, "", targetPortGroupName(nsInfo.portGroupIngressDenyName, nsInfo.portGroupEgressDenyName, policyType), nsInfo.aclLogging.Deny, policyType, sampling)
+
+		acls = append(acls, denyACL)
+		samples = append(samples, sample)
+	}
+	ops, err := libovsdbops.CreateSamplesOps(oc.nbClient, nil, acls, samples)
+	if err != nil {
+		klog.Errorf(err.Error())
+	}
+	ops, err = libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, ops, acls...)
+	if err != nil {
+		return err
+	}
+
+	if _, err := libovsdbops.TransactAndCheck(oc.nbClient, ovsDBOps); err != nil {
+		return fmt.Errorf("unable to update deny ACL for namespace %s: %w", ns, err)
+	}
+	return nil
+}
+
 func (oc *Controller) setACLLoggingForNamespace(ns string, nsInfo *namespaceInfo) error {
 	var ovsDBOps []ovsdb.Operation
 	for _, policyType := range []knet.PolicyType{knet.PolicyTypeIngress, knet.PolicyTypeEgress} {
-		denyACL, _ := buildDenyACLs(ns, "", targetPortGroupName(nsInfo.portGroupIngressDenyName, nsInfo.portGroupEgressDenyName, policyType), nsInfo.aclLogging.Deny, policyType)
+		var sampling *GressACLSampling
+		if policyType == knet.PolicyTypeIngress && nsInfo.aclSampling != nil && nsInfo.aclSampling.Ingress != nil {
+			sampling = nsInfo.aclSampling.Ingress
+		} else if policyType == knet.PolicyTypeEgress && nsInfo.aclSampling != nil && nsInfo.aclSampling.Egress != nil {
+			sampling = nsInfo.aclSampling.Egress
+		}
+		denyACL, _, _ := buildDenyACLs(ns, "", targetPortGroupName(nsInfo.portGroupIngressDenyName, nsInfo.portGroupEgressDenyName, policyType), nsInfo.aclLogging.Deny, policyType, sampling)
 		var err error
 		ovsDBOps, err = libovsdbops.UpdateACLsLoggingOps(oc.nbClient, ovsDBOps, denyACL)
 		if err != nil {

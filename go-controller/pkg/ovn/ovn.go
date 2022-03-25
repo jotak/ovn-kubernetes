@@ -96,6 +96,9 @@ type namespaceInfo struct {
 	// If not empty, then it has to be set to a logging a severity level, e.g. "notice", "alert", etc
 	aclLogging ACLLoggingLevels
 
+	// Namepsace-wide acl sampling information
+	aclSampling *ACLSampling
+
 	// Per-namespace port group default deny UUIDs
 	portGroupIngressDenyName string // Port group Name for ingress deny rule
 	portGroupEgressDenyName  string // Port group Name for egress deny rule
@@ -1253,6 +1256,23 @@ func (oc *Controller) aclLoggingCanEnable(annotation string, nsInfo *namespaceIn
 		}
 	}
 	return okCnt > 0
+}
+
+// Verify if controller can support ACL sampling and validate annotation
+func (oc *Controller) aclSamplingCanEnable(annotation string, nsInfo *namespaceInfo) bool {
+	// TODO: Add global knob
+	//if !oc.aclSamplingEnabled
+	if annotation == "" {
+		nsInfo.aclSampling = nil
+		return false
+	}
+	var sampling ACLSampling
+	err := json.Unmarshal([]byte(annotation), &sampling)
+	if err != nil {
+		return false
+	}
+	nsInfo.aclSampling = &sampling
+	return true
 }
 
 // gatewayChanged() compares old annotations to new and returns true if something has changed.
